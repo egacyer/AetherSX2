@@ -1,0 +1,109 @@
+name: Build Android (libemucore + APK repack)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      ANDROID_ABI: arm64-v8a
+      ANDROID_PLATFORM: android-26
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcc g++ cmake make ninja-build git wget \
+            openjdk-19-jre-headless unzip zip
+
+      - name: Setup Android NDK r23c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r23c
+          add-to-path: true
+
+      - name: Setup Android SDK (para zipalign / apksigner / build-tools)
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK build-tools
+        run: sdkmanager "build-tools;34.0.0"
+
+      - name: Create build directories
+        run: mkdir -p build-android/apk
+
+      # Equivalente ao passo 4 do README: configura o CMake com o toolchain do NDK
+      - name: Configure (CMake)
+        working-directory: build-android
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_PLATFORM=$ANDROID_PLATFORM \
+            -DANDROID_ABI=$ANDROID_ABI \
+            ..
+
+      # Equivalente ao passo 5: compila libemucore.so
+      - name: Build libemucore.so
+        working-directory: build-android
+        run: make -j"$(nproc)"
+
+      # Passo 6: baixa a "shell apk" (não é pública, precisa vir de um secret)
+      # Configure o secret SHELL_APK_URL no repositório (Settings > Secrets and variables > Actions)
+      - name: Download shell APK
+        working-directory: build-android/apk
+        run: wget -O NativeSX2.apk "${{ secrets.SHELL_APK_URL }}"
+
+      - name: Repack APK with libemucore.so
+        working-directory: build-android/apk
+        run: |
+          mkdir -p lib/$ANDROID_ABI
+          cp ../pcsx2/libemucore.so lib/$ANDROID_ABI/
+          zip -0 NativeSX2.apk lib/$ANDROID_ABI/libemucore.so
+
+      # Passo 7: zipalign
+      - name: Zipalign APK
+        working-directory: build-android/apk
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          "$BUILD_TOOLS/zipalign" -p 4 NativeSX2.apk NativeSX2-aligned.apk
+
+      # Assinatura: keystore deve vir de secrets (base64) para builds reprodutíveis
+      # Configure os secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS
+      - name: Decode keystore
+        working-directory: build-android/apk
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keyname.keystore
+
+      - name: Sign APK
+        working-directory: build-android/apk
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks keyname.keystore \
+            --ks-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --out NativeSX2-signed.apk \
+            --verbose NativeSX2-aligned.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeSX2-signed-apk
+          path: build-android/apk/NativeSX2-signed.apk
+
+      - name: Upload libemucore.so (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libemucore-so
+          path: build-android/pcsx2/libemucore.so
